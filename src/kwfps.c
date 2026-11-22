@@ -62,6 +62,11 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) { return E_NOTIMP
 #define G_LOGIC_FPS  ((volatile int *)0x00b7d4ccu)
 #define G_MAX_FPS    ((volatile int *)0x00b7d4d0u)
 #define G_GAMELOGIC  ((volatile uint8_t **)0x00bf7f98u)
+#define G_GLOBALDATA ((volatile uint8_t **)0x00bfbf24u) // TheWritableGlobalData
+#define GD_CAMERA_MIN_HEIGHT 0xcc // DefaultCameraMinHeight (float, stock 120)
+#define GD_CAMERA_MAX_HEIGHT 0xd0 // DefaultCameraMaxHeight (float, stock 300)
+
+static float camera_max_height; // 0 = leave the game's value
 
 typedef void(__fastcall *Fn0)(void *self, void *edx);
 typedef void(__fastcall *Fn1)(void *self, void *edx, int a);
@@ -143,7 +148,20 @@ static void flush_second(double t) {
 
 // ---------- hooks ----------
 
+// Keeps GameData's camera ceiling at the configured height. Checked every frame
+// because the INI loads after the DLL; the camera picks it up when a map loads.
+static void apply_camera(void) {
+    uint8_t *gd = (uint8_t *)*G_GLOBALDATA;
+    if (!gd || camera_max_height <= 0) return;
+    float *maxh = (float *)(gd + GD_CAMERA_MAX_HEIGHT);
+    if (*maxh != camera_max_height) {
+        log_line("camera max height %.0f -> %.0f (min %.0f)", *maxh, camera_max_height, *(float *)(gd + GD_CAMERA_MIN_HEIGHT));
+        *maxh = camera_max_height;
+    }
+}
+
 static void __fastcall hk_engine_update(void *self, void *edx) {
+    apply_camera();
     double t0 = now_ms();
     if (last_frame_start > 0) acc_add(&s_interval, t0 - last_frame_start);
     double interval = last_frame_start > 0 ? t0 - last_frame_start : 0;
@@ -257,6 +275,8 @@ static void open_log(HMODULE self) {
     char buf[32];
     GetPrivateProfileStringA("probe", "SpikeMs", "25", buf, sizeof buf, ini);
     spike_ms = atof(buf);
+    GetPrivateProfileStringA("camera", "MaxHeight", "0", buf, sizeof buf, ini);
+    camera_max_height = (float)atof(buf);
     strcat(path, "kwfps.log");
     logf = fopen(path, "a");
 }
