@@ -66,7 +66,13 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) { return E_NOTIMP
 #define GD_CAMERA_MIN_HEIGHT 0xcc // DefaultCameraMinHeight (float, stock 120)
 #define GD_CAMERA_MAX_HEIGHT 0xd0 // DefaultCameraMaxHeight (float, stock 300)
 
+#define GD_USE_FPS_LIMIT 0x52     // UseFPSLimit (bool); off = run as fast as possible
+#define GD_MP_MONEY_MULT 0xf78    // MultiPlayMoneyMult: 8 floats, one per player count
+
 static float camera_max_height; // 0 = leave the game's value
+static float money_mult;        // 0 = leave the game's value
+static int turbo_vk;            // virtual key that toggles turbo; 0 = none
+static int turbo_on, turbo_key_was_down;
 
 typedef void(__fastcall *Fn0)(void *self, void *edx);
 typedef void(__fastcall *Fn1)(void *self, void *edx, int a);
@@ -160,8 +166,40 @@ static void apply_camera(void) {
     }
 }
 
+// Income multiplier for skirmish/multiplayer. Replays don't store it, so a
+// replay must be played back with the same value or it will go out of sync.
+static void apply_money(void) {
+    uint8_t *gd = (uint8_t *)*G_GLOBALDATA;
+    if (!gd || money_mult <= 0) return;
+    float *m = (float *)(gd + GD_MP_MONEY_MULT);
+    if (m[0] != money_mult) {
+        log_line("money multiplier %.2f -> %.2f", m[0], money_mult);
+        for (int i = 0; i < 8; i++) m[i] = money_mult;
+    }
+}
+
+// Turbo: switch the frame limiter off so the simulation (one sub-step per
+// frame) runs as fast as the PC can draw. Only reacts while the game has focus.
+static void poll_turbo(void) {
+    if (!turbo_vk) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    int down = pid == GetCurrentProcessId() && (GetAsyncKeyState(turbo_vk) & 0x8000);
+    if (down && !turbo_key_was_down) {
+        uint8_t *gd = (uint8_t *)*G_GLOBALDATA;
+        if (gd) {
+            turbo_on = !turbo_on;
+            gd[GD_USE_FPS_LIMIT] = turbo_on ? 0 : 1;
+            log_line("turbo %s", turbo_on ? "on" : "off");
+        }
+    }
+    turbo_key_was_down = down;
+}
+
 static void __fastcall hk_engine_update(void *self, void *edx) {
     apply_camera();
+    apply_money();
+    poll_turbo();
     double t0 = now_ms();
     if (last_frame_start > 0) acc_add(&s_interval, t0 - last_frame_start);
     double interval = last_frame_start > 0 ? t0 - last_frame_start : 0;
@@ -277,6 +315,9 @@ static void open_log(HMODULE self) {
     spike_ms = atof(buf);
     GetPrivateProfileStringA("camera", "MaxHeight", "0", buf, sizeof buf, ini);
     camera_max_height = (float)atof(buf);
+    GetPrivateProfileStringA("cheats", "MoneyMult", "0", buf, sizeof buf, ini);
+    money_mult = (float)atof(buf);
+    turbo_vk = GetPrivateProfileIntA("keys", "TurboKey", 0x7A, ini); // F11
     strcat(path, "kwfps.log");
     logf = fopen(path, "a");
 }
