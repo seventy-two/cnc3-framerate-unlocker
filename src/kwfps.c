@@ -73,6 +73,7 @@ static float camera_max_height; // 0 = leave the game's value
 static float money_mult;        // 0 = leave the game's value
 static int turbo_vk;            // virtual key that toggles turbo; 0 = none
 static int turbo_on, turbo_key_was_down;
+static int pacing_on, client_rate, frame_cap; // [pacing] in kwfps.ini
 
 typedef void(__fastcall *Fn0)(void *self, void *edx);
 typedef void(__fastcall *Fn1)(void *self, void *edx, int a);
@@ -189,17 +190,187 @@ static void poll_turbo(void) {
         uint8_t *gd = (uint8_t *)*G_GLOBALDATA;
         if (gd) {
             turbo_on = !turbo_on;
-            gd[GD_USE_FPS_LIMIT] = turbo_on ? 0 : 1;
+            if (!pacing_on) gd[GD_USE_FPS_LIMIT] = turbo_on ? 0 : 1;
             log_line("turbo %s", turbo_on ? "on" : "off");
         }
     }
     turbo_key_was_down = down;
 }
 
+// ---------- pacing: real-time simulation steps, drawing at any frame rate ----------
+//
+// Stock: each drawn frame runs a fixed number of the logic frame's 6 sub-steps,
+// so game speed is tied to frame rate. Pacing replaces GameEngine::update
+// (0x5b0f9d, called from 0x7a5e48) with a version that runs sub-steps on a
+// real-time clock (6 x logic fps = 90 a second) and draws every frame, with a
+// continuous interpolation value. The engine's "max fps" (client frames per
+// second, used for client timings) is set to ClientRate in DllMain.
+
+#define CALL_ENGINE_UPDATE 0x007a5e48u // e8 rel32 -> 0x5b0f9d
+#define FN_SCRIPT_PRE      0x00577a8du // thiscall TheScriptEngine
+#define FN_SCRIPT_PAUSED   0x0055e4e2u // thiscall TheScriptEngine, returns bool
+#define FN_DEBUG_SETTIME   0x004f60f7u // cdecl(int)
+#define FN_SET_ALPHA       0x005b0f6du // thiscall engine: +0x48 = sub/6
+#define G_C24C0C     ((void **)0x00c24c0cu)
+#define G_SCRIPTENG  ((void **)0x00bf9ff8u)
+#define G_GAMECLIENT ((uint8_t **)0x00bf45c8u)
+#define G_DEBUG      ((void **)0x00bdafacu)
+#define G_XPIPE      ((void **)0x00c02650u)
+#define G_NET_SPEED  ((volatile float *)0x00b7a634u) // network game-speed factor, 1.0 normally
+#define PATCH_DIV6   0x0055c5b3u // GameLogic::update: push 6/pop eax/cdq/idiv ecx -> mov eax,1
+#define PATCH_WINDOW 0x004bf073u // Drawable interpolation window (imm8 in cmp eax,6)
+
+typedef char(__fastcall *FnC0)(void *self, void *edx);
+typedef void(__cdecl *FnCdeclI)(int);
+#define VFN(obj, off) (*(void **)(*(uintptr_t *)(obj) + (off)))
+
+static double pace_acc, pace_last;
+static int trace_left = -1; // >0: frames of pacing trace still to log ([pacing] Trace)
+
+static void engine_substep(uint8_t *e) {
+    int *E = (int *)e;
+    uint8_t *client = *G_GAMECLIENT;
+    if (E[0x10] == 6 && e[0x4c]) {
+        e[0x4c] = 0;
+        E[0x11] = *G_MAX_FPS / *G_LOGIC_FPS;
+    }
+    E[0x10]++;
+    ((FnCdeclI)FN_DEBUG_SETTIME)(*(int *)(*G_GAMELOGIC + 0x38) * 10 - 1 + E[0x10]);
+    ((Fn0)FN_SET_ALPHA)(e, 0);
+    if (E[0x10] <= 6) {
+        ((Fn1)VFN(e, 0x94))(e, 0, E[0x10]);
+        return;
+    }
+    if (E[0x14] % 25 == 0) { // the engine's logic-rate statistic (+0x58)
+        DWORD t = timeGetTime();
+        double el = (double)(DWORD)(t - (DWORD)E[0x15]);
+        ((float *)e)[0x16] = (float)(E[0x14] / (el * 0.001));
+        E[0x14] = 0;
+        E[0x15] = (int)timeGetTime();
+    }
+    int old = E[0x10];
+    E[0x14]++;
+    E[0x10] = 1;
+    ((Fn0)FN_SET_ALPHA)(e, 0);
+    ((Fn1)VFN(e, 0x94))(e, 0, 1);
+    if (client[0xd4] == 0) { // logic couldn't start a new frame (network wait)
+        E[0x10] = old;
+        ((Fn0)FN_SET_ALPHA)(e, 0);
+    } else {
+        e[0x4c] = 1;
+    }
+}
+
+static void __fastcall my_engine_update(void *self, void *edx) {
+    (void)edx;
+    uint8_t *e = (uint8_t *)self;
+    void *x = *G_C24C0C;
+    ((Fn0)VFN(x, 0x14))(x, 0);
+    void *se = *G_SCRIPTENG;
+    ((Fn0)FN_SCRIPT_PRE)(se, 0);
+    char paused = ((FnC0)FN_SCRIPT_PAUSED)(se, 0);
+    uint8_t *client = *G_GAMECLIENT;
+    double t = now_ms();
+    double dt = pace_last > 0 ? t - pace_last : 0;
+    pace_last = t;
+    if (paused) {
+        pace_acc = 0;
+        ((Fn0)VFN(e, 0x98))(e, 0);
+        client[0xd4] = 0;
+        ((Fn0)VFN(*G_DEBUG, 0x98))(*G_DEBUG, 0);
+        return;
+    }
+    double rate = 6.0 * *G_LOGIC_FPS * (*G_NET_SPEED > 0 ? *G_NET_SPEED : 1.0f); // sub-steps a second
+    if (turbo_on) rate *= 50;
+    pace_acc += dt * rate / 1000.0;
+    int max_steps = turbo_on ? 60 : 6; // below 15 fps the game slows rather than spiralling
+    int n = (int)pace_acc;
+    if (n > max_steps) { n = max_steps; pace_acc = n; }
+    pace_acc -= n;
+    client[0xd4] = 1;
+    for (int i = 0; i < n; i++) engine_substep(e);
+    // Continuous interpolation: (sub - 1 + fraction) / 6 runs 0..1 across a
+    // logic frame and meets itself at the boundary (one sub-step of latency).
+    float a = (float)((*(int *)(e + 0x40) - 1 + pace_acc) / 6.0);
+    *(float *)(e + 0x48) = a < 0 ? 0 : a > 1 ? 1 : a;
+    if (n == 0) client[0xd4] = 1; // advance the client frame every drawn frame
+    if (trace_left > 0 && logic_frame() > 300) {
+        trace_left--;
+        log_line("TRACE dt %.2f steps %d sub %d acc %.3f alpha %.4f lf %d", dt, n, *(int *)(e + 0x40), pace_acc,
+                 *(float *)(e + 0x48), logic_frame());
+    }
+    ((Fn0)VFN(e, 0x98))(e, 0);   // client update and draw
+    ((Fn0)VFN(*G_DEBUG, 0x98))(*G_DEBUG, 0);
+    ((Fn0)VFN(*G_XPIPE, 0x14))(*G_XPIPE, 0);
+}
+
+// Precise frame cap (the engine's own limiter is off in pacing mode).
+static double cap_next;
+static void cap_wait(void) {
+    if (!pacing_on || frame_cap <= 0 || turbo_on) { cap_next = 0; return; }
+    double period = 1000.0 / frame_cap, t = now_ms();
+    if (cap_next == 0 || t - cap_next > period * 2) cap_next = t;
+    while ((t = now_ms()) < cap_next - 1.5) Sleep(1);
+    while (now_ms() < cap_next) YieldProcessor();
+    cap_next += period;
+}
+
+static int patch_bytes(uint32_t addr, const uint8_t *expect, const uint8_t *with, size_t n, const char *name) {
+    if (memcmp((void *)(uintptr_t)addr, expect, n) != 0) {
+        log_line("patch %s: unexpected bytes at %08x; skipped", name, addr);
+        return 0;
+    }
+    DWORD old;
+    VirtualProtect((void *)(uintptr_t)addr, n, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void *)(uintptr_t)addr, with, n);
+    VirtualProtect((void *)(uintptr_t)addr, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)(uintptr_t)addr, n);
+    return 1;
+}
+
+// Applied in DllMain, before the exe's startup code reads the max fps.
+static void install_pacing(void) {
+    if (pacing_on) {
+        int old = *G_MAX_FPS;
+        DWORD prot;
+        VirtualProtect((void *)G_MAX_FPS, 4, PAGE_READWRITE, &prot);
+        *G_MAX_FPS = client_rate;
+        VirtualProtect((void *)G_MAX_FPS, 4, prot, &prot);
+        static const uint8_t div_old[] = {0x6a, 0x06, 0x8b, 0xc8, 0x58, 0x99, 0xf7, 0xf9};
+        static const uint8_t div_new[] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90};
+        int ok = patch_bytes(PATCH_DIV6, div_old, div_new, 8, "logic 6/ratio");
+        uint8_t call_old[5] = {0xe8}, call_new[5] = {0xe8};
+        int32_t rel_old = (int32_t)(0x005b0f9du - (CALL_ENGINE_UPDATE + 5));
+        int32_t rel_new = (int32_t)((uintptr_t)my_engine_update - (CALL_ENGINE_UPDATE + 5));
+        memcpy(call_old + 1, &rel_old, 4);
+        memcpy(call_new + 1, &rel_new, 4);
+        if (ok) ok = patch_bytes(CALL_ENGINE_UPDATE, call_old, call_new, 5, "engine update");
+        if (!ok) { // put the constant back so the stock loop stays safe
+            VirtualProtect((void *)G_MAX_FPS, 4, PAGE_READWRITE, &prot);
+            *G_MAX_FPS = old;
+            VirtualProtect((void *)G_MAX_FPS, 4, prot, &prot);
+            pacing_on = 0;
+        }
+        log_line("pacing %s: max fps %d -> %d, frame cap %d", pacing_on ? "on" : "FAILED", old, *G_MAX_FPS, frame_cap);
+        if (pacing_on) timeBeginPeriod(1);
+    }
+    // Drawable interpolation window: stock 6 client frames = 3 logic frames at
+    // 30 fps. Keep it at 3 logic frames for the actual client rate, or units
+    // freeze short of their stop point and then jump.
+    int win = 3 * *G_MAX_FPS / *G_LOGIC_FPS;
+    if (win > 127) win = 127;
+    static const uint8_t w_old[] = {0x06};
+    uint8_t w_new[] = {(uint8_t)win};
+    if (win != 6 && patch_bytes(PATCH_WINDOW, w_old, w_new, 1, "interpolation window"))
+        log_line("interpolation window 6 -> %d client frames", win);
+}
+
 static void __fastcall hk_engine_update(void *self, void *edx) {
     apply_camera();
     apply_money();
     poll_turbo();
+    if (pacing_on && *G_GLOBALDATA) (*G_GLOBALDATA)[GD_USE_FPS_LIMIT] = 0;
+    cap_wait();
     double t0 = now_ms();
     if (last_frame_start > 0) acc_add(&s_interval, t0 - last_frame_start);
     double interval = last_frame_start > 0 ? t0 - last_frame_start : 0;
@@ -214,7 +385,7 @@ static void __fastcall hk_engine_update(void *self, void *edx) {
     s_frames++;
 
     // A spike line describes the previous frame's gap plus this frame's work.
-    if (interval > spike_ms && f_sub_count > 0 && logic_frame() > 0) {
+    if (interval > spike_ms && logic_frame() > 0) {
         s_spikes++;
         char subs[96] = "";
         for (int i = 1; i <= 6; i++)
@@ -322,6 +493,10 @@ static void open_log(HMODULE self) {
     GetPrivateProfileStringA("cheats", "MoneyMult", "0", buf, sizeof buf, ini);
     money_mult = (float)atof(buf);
     turbo_vk = GetPrivateProfileIntA("keys", "TurboKey", 0x7A, ini); // F11
+    pacing_on = GetPrivateProfileIntA("pacing", "Enabled", 0, ini);
+    client_rate = GetPrivateProfileIntA("pacing", "ClientRate", 165, ini);
+    frame_cap = GetPrivateProfileIntA("pacing", "FrameCap", 162, ini);
+    trace_left = GetPrivateProfileIntA("pacing", "Trace", 0, ini);
     strcat(path, "kwfps.log");
     logf = fopen(path, "a");
 }
@@ -349,6 +524,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
         } else {
             log_line("kwfps loaded; logic fps %d, max fps %d", *G_LOGIC_FPS, *G_MAX_FPS);
             if (install()) log_line("hooks installed");
+            install_pacing();
         }
         s_start = now_ms();
     } else if (reason == DLL_PROCESS_DETACH && logf) {
