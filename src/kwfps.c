@@ -362,6 +362,13 @@ static void install_pacing(void) {
         log_line("pacing %s: max fps %d -> %d, frame cap %d", pacing_on ? "on" : "FAILED", old, *G_MAX_FPS, frame_cap);
         if (pacing_on) timeBeginPeriod(1);
     }
+    // Maps can set their own camera ceiling, which wins over GameData's
+    // (0x7b6a9b). With MaxHeight configured, always use GameData's.
+    if (camera_max_height > 0) {
+        static const uint8_t j_old[] = {0x75, 0x0e}, j_new[] = {0x90, 0x90};
+        if (patch_bytes(0x007b6ac2u, j_old, j_new, 2, "map camera height"))
+            log_line("map camera heights overridden by MaxHeight");
+    }
     // Drawable interpolation window: stock 6 client frames = 3 logic frames at
     // 30 fps. Keep it at 3 logic frames for the actual client rate, or units
     // freeze short of their stop point and then jump.
