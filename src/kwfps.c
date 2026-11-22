@@ -263,6 +263,10 @@ static void __fastcall hk_client_update(void *self, void *edx) {
 }
 
 static void __fastcall hk_display_draw(void *self, void *edx) {
+    // In turbo, draw (and present, which waits for vsync) only every 16th frame
+    // so the simulation isn't held to the refresh rate.
+    static unsigned turbo_frame;
+    if (turbo_on && (++turbo_frame & 15)) return;
     double t0 = now_ms();
     o_display_draw(self, edx);
     double dt = now_ms() - t0;
