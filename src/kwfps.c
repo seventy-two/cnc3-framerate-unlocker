@@ -336,6 +336,79 @@ static int patch_bytes(uint32_t addr, const uint8_t *expect, const uint8_t *with
     return 1;
 }
 
+// StreamDraw::Stream (beam and flame-stream effects) adds one segment every
+// client frame (its clock is GameClient+0x1c) and ages segments in seconds
+// (frames / the client rate at 0xbfc1e4). Its vertex buffer holds
+// (sides+1)*512 vertices, enough for ~128 segments: fine at 30 fps, but at 162
+// fps a long stream holds 5x as many and the mesh build (0x828b34) writes past
+// the buffer (crash at 0x829369). Keep emission at the stock 30 a second, and
+// as a safety net never build more segments than the buffers hold.
+#define CALL_STREAM_EMIT  0x0082a01fu   // call 0x829c13 in Stream::update
+#define CALL_STREAM_BUILD 0x0082a02du   // call 0x828b34
+#define G_CLIENT_RATE_F   ((volatile float *)0x00bfc1e4u)
+typedef void (__fastcall *StreamFn)(void *self);
+static const StreamFn stream_emit = (StreamFn)0x00829c13u;
+static const StreamFn stream_build = (StreamFn)0x00828b34u;
+typedef struct { uintptr_t key; double next; } EmitSlot;
+static EmitSlot emit_tab[1024];
+static int emit_used, stream_clamps, stream_max_points;
+
+static void __fastcall my_stream_emit(void *self) {
+    uint8_t *st = self;
+    double step = *G_CLIENT_RATE_F / 30.0;
+    if (step <= 1.0) { stream_emit(self); return; }
+    double clock = (double)*(int *)(st + 0x50);
+    uintptr_t key = (uintptr_t)self;
+    unsigned i = (unsigned)(key >> 3) & 1023;
+    while (emit_tab[i].key && emit_tab[i].key != key) i = (i + 1) & 1023;
+    if (!emit_tab[i].key) {
+        if (emit_used > 768) { memset(emit_tab, 0, sizeof emit_tab); emit_used = 0; i = (unsigned)(key >> 3) & 1023; }
+        emit_tab[i].key = key; emit_tab[i].next = clock; emit_used++;
+    }
+    // a stale entry (stream freed, another made at the same address) or a gap
+    if (emit_tab[i].next > clock + step || emit_tab[i].next < clock - step) emit_tab[i].next = clock;
+    if (clock >= emit_tab[i].next) {
+        emit_tab[i].next += step;
+        stream_emit(self);
+    }
+}
+
+static void __fastcall my_stream_build(void *self) {
+    uint8_t *st = self;
+    uint8_t **begin = (uint8_t **)(st + 0x10), *end = *(uint8_t **)(st + 0x14);
+    int sides = *(int *)(st + 0x44);
+    int count = *begin && end > *begin ? (int)((end - *begin) / 0x18) : 0;
+    int max_rows = sides > 0 ? 128 * (sides + 1) / sides : 0;
+    if (count > stream_max_points) { stream_max_points = count; log_line("stream: new max %d points (%d sides)", count, sides); }
+    if (max_rows > 256) max_rows = 256;
+    if (sides > 0 && count - 1 > max_rows) {
+        // build only the newest points (the vector's tail); the oldest, furthest
+        // along the stream, are dropped for this frame
+        uint8_t *orig = *begin;
+        *begin = end - (size_t)(max_rows + 1) * 0x18;
+        if (stream_clamps++ < 20) log_line("stream clamp: %d points, %d sides -> %d rows", count, sides, max_rows);
+        stream_build(self);
+        *begin = orig;
+        return;
+    }
+    stream_build(self);
+}
+
+static int redirect_call(uint32_t site, uint32_t target, void *hook, const char *name) {
+    uint8_t o[5] = {0xe8}, n[5] = {0xe8};
+    int32_t ro = (int32_t)(target - (site + 5));
+    int32_t rn = (int32_t)((uintptr_t)hook - (site + 5));
+    memcpy(o + 1, &ro, 4);
+    memcpy(n + 1, &rn, 4);
+    return patch_bytes(site, o, n, 5, name);
+}
+
+static void install_stream_fix(void) {
+    int a = redirect_call(CALL_STREAM_EMIT, 0x00829c13u, (void *)my_stream_emit, "stream emit");
+    int b = redirect_call(CALL_STREAM_BUILD, 0x00828b34u, (void *)my_stream_build, "stream build");
+    log_line("stream fix: emit limit %s, segment cap %s", a ? "on" : "FAILED", b ? "on" : "FAILED");
+}
+
 // Applied in DllMain, before the exe's startup code reads the max fps.
 static void install_pacing(void) {
     if (pacing_on) {
@@ -378,6 +451,7 @@ static void install_pacing(void) {
     uint8_t w_new[] = {(uint8_t)win};
     if (win != 6 && patch_bytes(PATCH_WINDOW, w_old, w_new, 1, "interpolation window"))
         log_line("interpolation window 6 -> %d client frames", win);
+    install_stream_fix();
 }
 
 static void __fastcall hk_engine_update(void *self, void *edx) {
