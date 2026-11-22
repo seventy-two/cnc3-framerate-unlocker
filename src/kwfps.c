@@ -187,6 +187,14 @@ static void poll_turbo(void) {
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
     int down = pid == GetCurrentProcessId() && (GetAsyncKeyState(turbo_vk) & 0x8000);
     if (down && !turbo_key_was_down) {
+        // Replay playback paces itself to real time (0x5af051) and stalls if
+        // pushed faster, so turbo is for live matches only.
+        uint8_t *rec = *(uint8_t **)0x00bfbf4cu; // TheRecorder; mode 1 = playback
+        if (!turbo_on && rec && *(int *)(rec + 0x18) == 1) {
+            log_line("turbo isn't available while playing a replay");
+            turbo_key_was_down = down;
+            return;
+        }
         uint8_t *gd = (uint8_t *)*G_GLOBALDATA;
         if (gd) {
             turbo_on = !turbo_on;
