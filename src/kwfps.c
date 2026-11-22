@@ -71,11 +71,14 @@ static Fn1 o_engine_logic, o_logic_update;
 
 // ---------- timing ----------
 
+// D3D9 puts the x87 FPU into single precision, so this is built with SSE maths
+// (-mfpmath=sse) and times are kept small by counting from a base tick.
 static double qpc_ms;
+static int64_t qpc_base;
 static inline double now_ms(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return (double)t.QuadPart * qpc_ms;
+    return (double)(t.QuadPart - qpc_base) * qpc_ms;
 }
 
 typedef struct { double sum, max; int n; } Acc;
@@ -155,7 +158,7 @@ static void __fastcall hk_engine_update(void *self, void *edx) {
     s_frames++;
 
     // A spike line describes the previous frame's gap plus this frame's work.
-    if (interval > spike_ms && f_sub_count > 0) {
+    if (interval > spike_ms && f_sub_count > 0 && logic_frame() > 0) {
         s_spikes++;
         char subs[96] = "";
         for (int i = 1; i <= 6; i++)
@@ -265,6 +268,9 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         qpc_ms = 1000.0 / (double)f.QuadPart;
+        LARGE_INTEGER b;
+        QueryPerformanceCounter(&b);
+        qpc_base = b.QuadPart;
         open_log(h);
         // Only touch engine addresses inside the game itself (cnc3ep1.dat at its
         // fixed base); anywhere else this is a plain dinput8 forwarder.
