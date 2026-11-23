@@ -14,7 +14,8 @@ nothing and the game runs as normal.
 1. Download `kwfps-<version>.zip` from Releases (or build it, below).
 2. Open the game folder (Steam: right-click Kane's Wrath > Manage > Browse
    local files) and go into `RetailExe\1.3`.
-3. Copy `dinput8.dll` and `kwfps.ini` there.
+3. Copy `dinput8.dll` and `kwfps.ini` there. With DXVK, copy `dxvk.conf` too
+   (or add its line to yours): it's worth up to 2x in big fights.
 
 After a game, `kwfps.log` in the same folder should say "hooks installed" and
 "pacing on". To uninstall, delete the two files. Settings are in `kwfps.ini`

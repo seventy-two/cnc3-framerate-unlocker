@@ -64,7 +64,7 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) { return E_NOTIMP
 #define G_GAMELOGIC  ((volatile uint8_t **)0x00bf7f98u)
 #define G_ENGINE_PTR ((uint8_t **)0x00bfbf04u) // TheGameEngine (+0x40 sub-step, +0x48 alpha)
 #define G_GLOBALDATA ((volatile uint8_t **)0x00bfbf24u) // TheWritableGlobalData
-#define KWFPS_VERSION "1.0"
+#define KWFPS_VERSION "1.1"
 #define GD_CAMERA_MIN_HEIGHT 0xcc // DefaultCameraMinHeight (float, stock 120)
 #define GD_CAMERA_MAX_HEIGHT 0xd0 // DefaultCameraMaxHeight (float, stock 300)
 

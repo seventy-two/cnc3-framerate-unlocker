@@ -1,4 +1,4 @@
-kwfps 1.0: high frame rate for C&C3 Kane's Wrath
+kwfps 1.1: high frame rate for C&C3 Kane's Wrath
 ==================================================
 
 What it does
@@ -18,7 +18,8 @@ Install
 1. Open the game folder, e.g. for Steam:
    Steam > Library > right-click Kane's Wrath > Manage > Browse local files
 2. Go into RetailExe\1.3
-3. Copy dinput8.dll and kwfps.ini into that folder.
+3. Copy dinput8.dll and kwfps.ini into that folder. If you use DXVK, copy
+   dxvk.conf too (or add its line to your own dxvk.conf).
 4. Play.
 
 To check it's working, open kwfps.log in the same folder after playing. It
@@ -28,10 +29,13 @@ Settings are in kwfps.ini (frame rate, zoom-out, turbo key).
 
 Tips
 - A G-Sync or FreeSync monitor gives the smoothest result.
-- Big battles are limited by the CPU: expect dips to around 100 fps in
-  huge late-game fights. The stock game drops further at those moments.
+- Big battles are limited by one CPU core: expect short dips to around
+  100 fps in the biggest fights. The stock game drops further there.
+- DXVK (github.com/doitsujin/dxvk, the 32-bit d3d9.dll) runs this game
+  faster than native Direct3D 9; use it with the included dxvk.conf.
 
 Uninstall
-Delete dinput8.dll and kwfps.ini (and kwfps.log) from RetailExe\1.3.
+Delete dinput8.dll, kwfps.ini, kwfps.log (and dxvk.conf if you copied it)
+from RetailExe\1.3.
 
 Not tested in online multiplayer.
