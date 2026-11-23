@@ -134,6 +134,112 @@ static int logic_frame(void) {
 #define G_W3D_SYNC ((volatile int *)0x00bdcf3cu) // WW3D sync time (ms), set by W3DDisplay::draw
 static int s_sync_prev;
 
+
+// ---------- sampling profiler ([debug] Profile) ----------
+// A thread samples the main thread's EIP about 1000 times a second. In seconds
+// slower than Profile fps, the busiest addresses (and, for samples outside the
+// exe, the nearest exe return address on the stack) are logged as PROF lines.
+typedef struct { uint32_t key, n; } ProfEnt;
+#define PROF_TAB 2048
+static ProfEnt prof_eip[2][PROF_TAB], prof_call[2][PROF_TAB];
+static volatile LONG prof_cur;
+static volatile LONG prof_total[2];
+static HANDLE prof_main;
+static int profile_below; // 0 = off
+
+static void prof_add(ProfEnt *t, uint32_t key) {
+    uint32_t h = (key * 2654435761u) >> 21; // 11 bits
+    for (int i = 0; i < 64; i++) {
+        ProfEnt *e = &t[(h + i) & (PROF_TAB - 1)];
+        if (e->key == key) { e->n++; return; }
+        if (e->key == 0) { e->key = key; e->n = 1; return; }
+    }
+}
+
+static DWORD WINAPI prof_thread(LPVOID arg) {
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    for (;;) {
+        Sleep(1);
+        if (SuspendThread(prof_main) == (DWORD)-1) continue;
+        CONTEXT c = {.ContextFlags = CONTEXT_CONTROL};
+        if (GetThreadContext(prof_main, &c)) {
+            int b = prof_cur;
+            uint32_t eip = c.Eip;
+            prof_add(prof_eip[b], eip & ~0xfu);
+            if (eip < 0x401000u || eip >= 0xa00000u) {
+                // nearest return address into the exe's code
+                const uint32_t *sp = (const uint32_t *)c.Esp;
+                MEMORY_BASIC_INFORMATION mi;
+                if (VirtualQuery(sp, &mi, sizeof mi) && mi.State == MEM_COMMIT) {
+                    const uint32_t *end = (const uint32_t *)((uint8_t *)mi.BaseAddress + mi.RegionSize);
+                    for (int i = 0; i < 256 && sp + i < end; i++)
+                        if (sp[i] >= 0x401000u && sp[i] < 0xa00000u) { prof_add(prof_call[b], sp[i]); break; }
+                }
+            }
+            InterlockedIncrement(&prof_total[b]);
+        }
+        ResumeThread(prof_main);
+    }
+    return 0;
+}
+
+static int prof_cmp(const void *a, const void *b) {
+    return (int)((const ProfEnt *)b)->n - (int)((const ProfEnt *)a)->n;
+}
+
+static void prof_name(uint32_t a, char *out, size_t n) {
+    MEMORY_BASIC_INFORMATION mi;
+    char path[MAX_PATH] = "?";
+    if (VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi) && mi.AllocationBase &&
+        GetModuleFileNameA((HMODULE)mi.AllocationBase, path, sizeof path)) {
+        const char *base = strrchr(path, '\\');
+        base = base ? base + 1 : path;
+        if ((uintptr_t)mi.AllocationBase == 0x400000u) snprintf(out, n, "%08x", a);
+        else snprintf(out, n, "%s+%x", base, a - (uint32_t)(uintptr_t)mi.AllocationBase);
+    } else snprintf(out, n, "%08x", a);
+}
+
+static void prof_dump(ProfEnt *t, int total, const char *what) {
+    static ProfEnt tmp[PROF_TAB];
+    memcpy(tmp, t, sizeof tmp);
+    qsort(tmp, PROF_TAB, sizeof tmp[0], prof_cmp);
+    char line[1024];
+    int len = snprintf(line, sizeof line, "PROF %s (%d samples):", what, total);
+    for (int i = 0; i < 16 && tmp[i].n; i++) {
+        char nm[96];
+        prof_name(tmp[i].key, nm, sizeof nm);
+        len += snprintf(line + len, sizeof line - len, " %s %.1f%%", nm, 100.0 * tmp[i].n / total);
+        if (len > (int)sizeof line - 120) break;
+    }
+    log_line("%s", line);
+}
+
+static void prof_second(double fps) {
+    if (!prof_main) return;
+    int b = prof_cur;
+    InterlockedExchange(&prof_cur, b ^ 1);
+    Sleep(0);
+    int total = prof_total[b];
+    if (fps < profile_below && total > 100) {
+        prof_dump(prof_eip[b], total, "eip");
+        prof_dump(prof_call[b], total, "caller");
+    }
+    memset(prof_eip[b], 0, sizeof prof_eip[b]);
+    memset(prof_call[b], 0, sizeof prof_call[b]);
+    prof_total[b] = 0;
+}
+
+static void prof_start(void) {
+    if (profile_below <= 0 || prof_main) return;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &prof_main,
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
+    if (prof_main) {
+        CreateThread(NULL, 0, prof_thread, NULL, 0, NULL);
+        log_line("profiler on: logging seconds under %d fps", profile_below);
+    }
+}
+
 static void flush_second(double t) {
     int sync = *G_W3D_SYNC, sync_d = sync - s_sync_prev;
     s_sync_prev = sync;
@@ -149,6 +255,7 @@ static void flush_second(double t) {
                  acc_avg(&s_sub[1]), s_sub[1].max, acc_avg(&s_sub[2]), s_sub[2].max, acc_avg(&s_sub[3]), s_sub[3].max,
                  acc_avg(&s_sub[4]), s_sub[4].max, acc_avg(&s_sub[5]), s_sub[5].max, acc_avg(&s_sub[6]), s_sub[6].max,
                  s_sub[1].n, sync_d / secs, s_spikes, logic_frame());
+        prof_second(s_frames / secs);
         fflush(logf);
     }
     memset(&s_interval, 0, sizeof s_interval);
@@ -285,6 +392,7 @@ static void engine_substep(uint8_t *e) {
 
 static void __fastcall my_engine_update(void *self, void *edx) {
     (void)edx;
+    if (profile_below > 0 && !prof_main) prof_start();
     uint8_t *e = (uint8_t *)self;
     void *x = *G_C24C0C;
     ((Fn0)VFN(x, 0x14))(x, 0);
@@ -697,6 +805,7 @@ static void open_log(HMODULE self) {
     anim_fix = GetPrivateProfileIntA("debug", "AnimFix", 1, ini);
     pos_trace = GetPrivateProfileIntA("debug", "PosTrace", 0, ini);
     pos_from = GetPrivateProfileIntA("debug", "PosFrom", 1200, ini);
+    profile_below = GetPrivateProfileIntA("debug", "Profile", 0, ini);
     strcat(path, "kwfps.log");
     logf = fopen(path, "w"); // one launch per log, so it never grows without limit
 }

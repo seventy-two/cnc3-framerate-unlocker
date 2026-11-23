@@ -95,6 +95,15 @@ Trace = 0              ; frames of interpolation trace to log
 PushFix = 1            ; interpolation push window fix
 AnimFix = 1            ; animation clock follows game time (pacing only)
 PosTrace = 0           ; frames of one moving unit's drawn position to log (POS lines)
+Profile = 0            ; sample the main thread; log PROF lines for seconds under this fps
 ```
 
-`bench/posjumps.py <logs>` counts jumps in POS traces.
+`bench/posjumps.py <logs>` counts jumps in POS traces; `bench/window.py <log> [lf from to]`
+summarises a stretch of a run.
+
+## DXVK
+
+With DXVK, set `d3d9.cachedWriteOnlyBuffers = True` in `dxvk.conf`. The game reads
+back from write-only vertex buffers while building effect quads (0x62142a); in
+uncached memory those reads stalled big fights at ~32 fps. With the option the
+same fight bottoms out at ~78 fps (draw 20.8 → 8.8 ms).
