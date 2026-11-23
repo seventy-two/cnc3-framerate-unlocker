@@ -15,6 +15,16 @@ It forwards DirectInput to the system DLL, and only inside the game:
   6 client frames (3 logic frames at stock 30 fps). At higher rates that cut
   interpolation short, and units jumped when they stopped. The window is scaled
   to the client rate.
+- **Interpolation push fix**: the same 6-frame cut-off guards the position
+  history push at the start of each logic frame. Units move in sub-steps 3 and
+  5, ~7 client frames earlier at 162 fps, so the push was skipped and units
+  jumped back and forth (227 jumps in 3,700 traced frames before, 1 after).
+- **Animation clock**: model animations advanced by a fixed 1000/maxfps ms
+  (an int, 6 at 162) per drawn frame. With pacing they advance by the game time
+  each frame covers (1000 ms a second, whatever the frame rate).
+- **Stream effect fix**: beam/flame streams added a segment per drawn frame and
+  overflowed their vertex buffer at high fps (crash at 0x829369). Segments are
+  emitted at the stock 30 a second, with a hard cap as a safety net.
 - **Camera** (`[camera] MaxHeight`): higher zoom-out ceiling, overriding map values.
 - **Turbo** (`[keys] TurboKey`, F11): simulation flat out, drawing 1 frame in 16.
   Live matches only (replay playback paces itself to real time).
@@ -55,4 +65,11 @@ Enabled = 1
 ClientRate = 162       ; client frames a second the engine assumes; match FrameCap
 FrameCap = 162         ; 0 = uncapped; a little under the refresh rate for G-Sync
 Trace = 0              ; frames of interpolation trace to log
+
+[debug]
+PushFix = 1            ; interpolation push window fix
+AnimFix = 1            ; animation clock follows game time (pacing only)
+PosTrace = 0           ; frames of one moving unit's drawn position to log (POS lines)
 ```
+
+`bench/posjumps.py <logs>` counts jumps in POS traces.

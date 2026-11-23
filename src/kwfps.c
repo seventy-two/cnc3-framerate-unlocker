@@ -62,6 +62,7 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) { return E_NOTIMP
 #define G_LOGIC_FPS  ((volatile int *)0x00b7d4ccu)
 #define G_MAX_FPS    ((volatile int *)0x00b7d4d0u)
 #define G_GAMELOGIC  ((volatile uint8_t **)0x00bf7f98u)
+#define G_ENGINE_PTR ((uint8_t **)0x00bfbf04u) // TheGameEngine (+0x40 sub-step, +0x48 alpha)
 #define G_GLOBALDATA ((volatile uint8_t **)0x00bfbf24u) // TheWritableGlobalData
 #define GD_CAMERA_MIN_HEIGHT 0xcc // DefaultCameraMinHeight (float, stock 120)
 #define GD_CAMERA_MAX_HEIGHT 0xd0 // DefaultCameraMaxHeight (float, stock 300)
@@ -74,6 +75,7 @@ static float money_mult;        // 0 = leave the game's value
 static int turbo_vk;            // virtual key that toggles turbo; 0 = none
 static int turbo_on, turbo_key_was_down;
 static int pacing_on, client_rate, frame_cap; // [pacing] in kwfps.ini
+static int push_fix = 1, anim_fix = 1, pos_trace; // [debug]
 
 typedef void(__fastcall *Fn0)(void *self, void *edx);
 typedef void(__fastcall *Fn1)(void *self, void *edx, int a);
@@ -127,19 +129,24 @@ static int logic_frame(void) {
     return gl ? *(const int *)(gl + 0x38) : -1;
 }
 
+#define G_W3D_SYNC ((volatile int *)0x00bdcf3cu) // WW3D sync time (ms), set by W3DDisplay::draw
+static int s_sync_prev;
+
 static void flush_second(double t) {
+    int sync = *G_W3D_SYNC, sync_d = sync - s_sync_prev;
+    s_sync_prev = sync;
     if (s_sub[1].n + s_sub[2].n + s_sub[3].n + s_sub[4].n + s_sub[5].n + s_sub[6].n > 0) {
         double secs = (t - s_start) / 1000.0;
         log_line("fps %5.1f | frame avg %5.2f max %6.2f | update %5.2f/%6.2f | client %5.2f/%6.2f"
                  " (gameclient %5.2f/%6.2f, draw %5.2f/%6.2f) | logic %5.2f/%6.2f"
                  " | sub1 %5.2f/%6.2f sub2 %5.2f/%6.2f sub3 %5.2f/%6.2f sub4 %5.2f/%6.2f sub5 %5.2f/%6.2f sub6 %5.2f/%6.2f"
-                 " | logicsteps/s %d | spikes %d | lf %d",
+                 " | logicsteps/s %d | anim %.0f ms/s | spikes %d | lf %d",
                  s_frames / secs, acc_avg(&s_interval), s_interval.max, acc_avg(&s_update), s_update.max,
                  acc_avg(&s_client), s_client.max, acc_avg(&s_clientupd), s_clientupd.max, acc_avg(&s_draw), s_draw.max,
                  acc_avg(&s_logic), s_logic.max,
                  acc_avg(&s_sub[1]), s_sub[1].max, acc_avg(&s_sub[2]), s_sub[2].max, acc_avg(&s_sub[3]), s_sub[3].max,
                  acc_avg(&s_sub[4]), s_sub[4].max, acc_avg(&s_sub[5]), s_sub[5].max, acc_avg(&s_sub[6]), s_sub[6].max,
-                 s_sub[1].n, s_spikes, logic_frame());
+                 s_sub[1].n, sync_d / secs, s_spikes, logic_frame());
         fflush(logf);
     }
     memset(&s_interval, 0, sizeof s_interval);
@@ -227,12 +234,17 @@ static void poll_turbo(void) {
 #define G_NET_SPEED  ((volatile float *)0x00b7a634u) // network game-speed factor, 1.0 normally
 #define PATCH_DIV6   0x0055c5b3u // GameLogic::update: push 6/pop eax/cdq/idiv ecx -> mov eax,1
 #define PATCH_WINDOW 0x004bf073u // Drawable interpolation window (imm8 in cmp eax,6)
+#define PATCH_WINDOW_PUSH 0x004bab61u // same window in the position-history push (0x4bab25)
+#define PATCH_ANIM_CLOCK  0x007f0f6cu // W3DDisplay::draw: mov eax,[0xc0956c] (ms per client frame) before imul/add to the sync time
+#define G_MS_PER_FRAME ((volatile int *)0x00c0956cu)
 
 typedef char(__fastcall *FnC0)(void *self, void *edx);
 typedef void(__cdecl *FnCdeclI)(int);
 #define VFN(obj, off) (*(void **)(*(uintptr_t *)(obj) + (off)))
 
 static double pace_acc, pace_last;
+static volatile int anim_ms_frame = 33; // ms of game time this drawn frame covered (animation clock)
+static double anim_prev_acc, anim_carry;
 static int trace_left = -1; // >0: frames of pacing trace still to log ([pacing] Trace)
 
 static void engine_substep(uint8_t *e) {
@@ -283,6 +295,7 @@ static void __fastcall my_engine_update(void *self, void *edx) {
     pace_last = t;
     if (paused) {
         pace_acc = 0;
+        anim_prev_acc = 0;
         ((Fn0)VFN(e, 0x98))(e, 0);
         client[0xd4] = 0;
         ((Fn0)VFN(*G_DEBUG, 0x98))(*G_DEBUG, 0);
@@ -297,6 +310,12 @@ static void __fastcall my_engine_update(void *self, void *edx) {
     pace_acc -= n;
     client[0xd4] = 1;
     for (int i = 0; i < n; i++) engine_substep(e);
+    // game time covered by this frame, for the animation clock (whole ms, carrying the rest)
+    anim_carry += (n + pace_acc - anim_prev_acc) * 1000.0 / (6.0 * *G_LOGIC_FPS);
+    anim_prev_acc = pace_acc;
+    if (anim_carry < 0) anim_carry = 0;
+    anim_ms_frame = (int)anim_carry;
+    anim_carry -= anim_ms_frame;
     // Continuous interpolation: (sub - 1 + fraction) / 6 runs 0..1 across a
     // logic frame and meets itself at the boundary (one sub-step of latency).
     float a = (float)((*(int *)(e + 0x40) - 1 + pace_acc) / 6.0);
@@ -409,6 +428,57 @@ static void install_stream_fix(void) {
     log_line("stream fix: emit limit %s, segment cap %s", a ? "on" : "FAILED", b ? "on" : "FAILED");
 }
 
+
+// ---------- debug: trace one moving unit's drawn position every client frame ----------
+// Wraps Drawable::getInterpolatedPosition (0x4bf012) with a trampoline; logs
+// POS lines ([debug] PosTrace = frames) to check motion for jumps.
+#define FN_INTERP_POS 0x004bf012u
+typedef uint8_t *(__fastcall *FnInterp)(uint8_t *d);
+static FnInterp interp_tramp;
+static uint8_t *pos_tracked;
+static int pos_last_frame = -1, pos_idle;
+
+static int client_frame(void) {
+    uint8_t *c = *G_GAMECLIENT;
+    return ((int(__fastcall *)(void *, void *))VFN(c, 0x78))(c, 0);
+}
+
+static uint8_t *__fastcall my_interp_pos(uint8_t *d) {
+    uint8_t *r = interp_tramp(d);
+    if (pos_trace <= 0 || logic_frame() < 1200 || *(int *)(d + 0x140) == 0) return r;
+    int cf = client_frame();
+    float *h = (float *)(d + 0xc4); // p0 c4, p1 d0, p2 dc, p3 e8
+    if (!pos_tracked) {
+        float dx = h[6] - h[3], dy = h[7] - h[4];
+        if (*(int *)(d + 0x138) != -1 && dx * dx + dy * dy > 1.0f) { pos_tracked = d; pos_idle = 0; log_line("POS track %p", (void *)d); }
+        else return r;
+    }
+    if (d != pos_tracked || cf == pos_last_frame) return r;
+    pos_last_frame = cf;
+    float *p = (float *)r;
+    uint8_t *e = *G_ENGINE_PTR;
+    log_line("POS cf %d lf %d sub %d a %.4f moved %d | %.3f %.3f %.3f | p1 %.3f %.3f p2 %.3f %.3f", cf, logic_frame(),
+             *(int *)(e + 0x40), *(float *)(e + 0x48), cf - *(int *)(d + 0x138), p[0], p[1], p[2], h[3], h[4], h[6], h[7]);
+    if (cf - *(int *)(d + 0x138) > 200) { pos_tracked = NULL; log_line("POS lost (idle)"); }
+    pos_trace--;
+    return r;
+}
+
+static void install_pos_trace(void) {
+    static const uint8_t head[] = {0x56, 0x57, 0x8b, 0xf1, 0x33, 0xff};
+    if (memcmp((void *)FN_INTERP_POS, head, 6) != 0) { log_line("pos trace: unexpected bytes"); return; }
+    uint8_t *t = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    memcpy(t, head, 6);
+    t[6] = 0xe9;
+    int32_t rel = (int32_t)((FN_INTERP_POS + 6) - ((uintptr_t)t + 11));
+    memcpy(t + 7, &rel, 4);
+    interp_tramp = (FnInterp)t;
+    uint8_t j[6] = {0xe9, 0, 0, 0, 0, 0x90};
+    rel = (int32_t)((uintptr_t)my_interp_pos - (FN_INTERP_POS + 5));
+    memcpy(j + 1, &rel, 4);
+    if (patch_bytes(FN_INTERP_POS, head, j, 6, "pos trace")) log_line("pos trace on: %d frames", pos_trace);
+}
+
 // Applied in DllMain, before the exe's startup code reads the max fps.
 static void install_pacing(void) {
     if (pacing_on) {
@@ -451,7 +521,27 @@ static void install_pacing(void) {
     uint8_t w_new[] = {(uint8_t)win};
     if (win != 6 && patch_bytes(PATCH_WINDOW, w_old, w_new, 1, "interpolation window"))
         log_line("interpolation window 6 -> %d client frames", win);
+    // The same cut-off guards the position-history push at the start of each
+    // logic frame (0x4bab25, called in sub-step 1). Units move in sub-steps 3
+    // and 5, so at 162 fps that's ~7 client frames later and the push was
+    // skipped: the unit then blends between stale points (jumps and jitter).
+    if (win != 6 && push_fix && patch_bytes(PATCH_WINDOW_PUSH, w_old, w_new, 1, "interpolation push window"))
+        log_line("interpolation push window 6 -> %d client frames", win);
+    // Model animation clock: W3DDisplay::draw advances WW3D's sync time by
+    // 1000/maxfps ms (an int: 6 at 162) per drawn frame, whatever the real frame
+    // time, so animations drift against the simulation whenever fps moves.
+    // With pacing, advance it by the game time each frame actually covered.
+    if (pacing_on && anim_fix) {
+        static const uint8_t a_old[] = {0xa1, 0x6c, 0x95, 0xc0, 0x00};
+        uint8_t a_new[5] = {0xa1};
+        uint32_t addr = (uint32_t)(uintptr_t)&anim_ms_frame;
+        memcpy(a_new + 1, &addr, 4);
+        anim_ms_frame = 1000 / client_rate; // until the first paced frame
+        if (patch_bytes(PATCH_ANIM_CLOCK, a_old, a_new, 5, "animation clock"))
+            log_line("animation clock follows game time");
+    }
     install_stream_fix();
+    if (pos_trace > 0) install_pos_trace();
 }
 
 static void __fastcall hk_engine_update(void *self, void *edx) {
@@ -586,6 +676,9 @@ static void open_log(HMODULE self) {
     client_rate = GetPrivateProfileIntA("pacing", "ClientRate", 165, ini);
     frame_cap = GetPrivateProfileIntA("pacing", "FrameCap", 162, ini);
     trace_left = GetPrivateProfileIntA("pacing", "Trace", 0, ini);
+    push_fix = GetPrivateProfileIntA("debug", "PushFix", 1, ini);
+    anim_fix = GetPrivateProfileIntA("debug", "AnimFix", 1, ini);
+    pos_trace = GetPrivateProfileIntA("debug", "PosTrace", 0, ini);
     strcat(path, "kwfps.log");
     logf = fopen(path, "a");
 }
