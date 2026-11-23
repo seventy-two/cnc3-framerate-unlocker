@@ -222,6 +222,46 @@ static void prof_dump(ProfEnt *t, int total, const char *what) {
     log_line("%s", line);
 }
 
+
+// Every slow second's samples, kept for the whole run and rewritten to
+// kwfps-prof.txt (one "e|c addr [addr2] count" line per entry) after each one.
+#define PROF_ALL 65536
+static ProfEnt prof_all_e[PROF_ALL], prof_all_c[PROF_ALL];
+static int prof_all_total, prof_all_secs;
+static char prof_path[MAX_PATH];
+static void prof_merge(ProfEnt *dst, const ProfEnt *src) {
+    for (int i = 0; i < PROF_TAB; i++) {
+        if (!src[i].key) continue;
+        uint32_t h = ((src[i].key ^ (src[i].key2 * 31u)) * 2654435761u) >> 16;
+        for (int j = 0; j < 256; j++) {
+            ProfEnt *e = &dst[(h + j) & (PROF_ALL - 1)];
+            if (e->key == src[i].key && e->key2 == src[i].key2) { e->n += src[i].n; break; }
+            if (!e->key) { *e = src[i]; break; }
+        }
+    }
+}
+static void prof_write(FILE *f, const char *tag, const ProfEnt *t) {
+    for (int i = 0; i < PROF_ALL; i++) {
+        if (!t[i].key) continue;
+        char nm[96];
+        prof_name(t[i].key, nm, sizeof nm);
+        if (t[i].key2) fprintf(f, "%s %s %08x %u\n", tag, nm, t[i].key2, t[i].n);
+        else fprintf(f, "%s %s - %u\n", tag, nm, t[i].n);
+    }
+}
+static void prof_keep(const ProfEnt *e, const ProfEnt *c, int total) {
+    prof_merge(prof_all_e, e);
+    prof_merge(prof_all_c, c);
+    prof_all_total += total;
+    prof_all_secs++;
+    FILE *f = fopen(prof_path, "w");
+    if (!f) return;
+    fprintf(f, "# %d samples over %d seconds under %d fps\n", prof_all_total, prof_all_secs, profile_below);
+    prof_write(f, "e", prof_all_e);
+    prof_write(f, "c", prof_all_c);
+    fclose(f);
+}
+
 static void prof_second(double fps) {
     if (!prof_main) return;
     int b = prof_cur;
@@ -231,6 +271,7 @@ static void prof_second(double fps) {
     if (fps < profile_below && total > 100) {
         prof_dump(prof_eip[b], total, "eip");
         prof_dump(prof_call[b], total, "caller");
+        prof_keep(prof_eip[b], prof_call[b], total);
     }
     memset(prof_eip[b], 0, sizeof prof_eip[b]);
     memset(prof_call[b], 0, sizeof prof_call[b]);
@@ -846,6 +887,7 @@ static void open_log(HMODULE self) {
     pos_from = GetPrivateProfileIntA("debug", "PosFrom", 1200, ini);
     profile_below = GetPrivateProfileIntA("debug", "Profile", 0, ini);
     fast_lock_on = GetPrivateProfileIntA("debug", "FastLock", 1, ini);
+    snprintf(prof_path, sizeof prof_path, "%skwfps-prof.txt", path);
     strcat(path, "kwfps.log");
     logf = fopen(path, "w"); // one launch per log, so it never grows without limit
 }
