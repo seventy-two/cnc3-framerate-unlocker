@@ -1,6 +1,27 @@
-# kwfps
+# C&C3 Kane's Wrath framerate unlocker
 
-High frame rate and quality-of-life DLL for Command & Conquer 3: Kane's Wrath (Steam).
+Play Command & Conquer 3: Kane's Wrath at your monitor's refresh rate (144,
+165 fps and up) instead of 30, with the game speed unchanged and units moving
+and animating smoothly. It also raises the zoom-out limit and adds a turbo key
+for skirmish.
+
+## Install
+
+You need Kane's Wrath with the **4K Add-On** installed (it brings the 1.03
+patch and the 1.3 game exe this is built for). On any other version it does
+nothing and the game runs as normal.
+
+1. Download `kwfps-<version>.zip` from Releases (or build it, below).
+2. Open the game folder (Steam: right-click Kane's Wrath > Manage > Browse
+   local files) and go into `RetailExe\1.3`.
+3. Copy `dinput8.dll` and `kwfps.ini` there.
+
+After a game, `kwfps.log` in the same folder should say "hooks installed" and
+"pacing on". To uninstall, delete the two files. Settings are in `kwfps.ini`
+(below). Replays recorded with it play back normally; online multiplayer
+hasn't been tested.
+
+## How it works
 
 It's a 32-bit `dinput8.dll` proxy that sits next to `RetailExe\1.3\cnc3ep1.dat`.
 It forwards DirectInput to the system DLL, and only inside the game:
@@ -38,9 +59,10 @@ that part alone.
 
 ## Files
 
-- `src/kwfps.c`: the DLL. Build with `./build.sh` (needs `gcc-mingw-w64-i686`).
+- `src/kwfps.c`: the DLL. Build with `./build.sh` (needs `gcc-mingw-w64-i686`);
+  `./package.sh` makes the release zip.
 - `test/loadtest.c`: console load test (no dialogs; never test with rundll32).
-- `bench/run.sh <name> <dxvk|reshade> [replay]`: plays a replay muted with the
+- `bench/` (my test rig, WSL-specific): `run.sh <name> <dxvk|reshade> [replay]`: plays a replay muted with the
   camera following the fighting, stops at the end, and keeps the log and an
   end-screen screenshot in `bench/logs/`.
 - `bench/summary.py <logs>`: per-run averages, percentiles and spike causes.
