@@ -46,6 +46,10 @@ It forwards DirectInput to the system DLL, and only inside the game:
 - **Stream effect fix**: beam/flame streams added a segment per drawn frame and
   overflowed their vertex buffer at high fps (crash at 0x829369). Segments are
   emitted at the stock 30 a second, with a hard cap as a safety net.
+- **Engine lock**: the engine's global recursive lock used a kernel mutex, so
+  every lock and unlock was a kernel call. It uses a critical section instead
+  (the bridge fight in a test replay: lowest 73 → 98 fps). `[debug] FastLock = 0`
+  turns it off.
 - **Camera** (`[camera] MaxHeight`): higher zoom-out ceiling, overriding map values.
 - **Turbo** (`[keys] TurboKey`, F11): simulation flat out, drawing 1 frame in 16.
   Live matches only (replay playback paces itself to real time).

@@ -30,7 +30,7 @@ if [ "$ZOOMOUT" = 1 ]; then
   (while :; do powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$W\\kw-wheel.ps1" -x 2560 -y 1300 -n -15 >/dev/null 2>&1; sleep 20; done) &
   zpid=$!
 fi
-until [ "$(grep -v SPIKE "$L" | tail -1 | grep -o 'lf [0-9]*' | cut -d' ' -f2)" -ge "$stop" ] 2>/dev/null || ! tasklist.exe 2>/dev/null | grep -qi "cnc3ep1.dat"; do sleep 3; done
+until [ "$(grep " fps " "$L" | grep -v SPIKE | tail -1 | grep -o 'lf [0-9]*' | cut -d' ' -f2)" -ge "$stop" ] 2>/dev/null || ! tasklist.exe 2>/dev/null | grep -qi "cnc3ep1.dat"; do sleep 3; done
 kill $fpid $gpid $zpid 2>/dev/null
 taskkill.exe /IM cnc3ep1.dat /F >/dev/null
 sleep 2

@@ -139,7 +139,7 @@ static int s_sync_prev;
 // A thread samples the main thread's EIP about 1000 times a second. In seconds
 // slower than Profile fps, the busiest addresses (and, for samples outside the
 // exe, the nearest exe return address on the stack) are logged as PROF lines.
-typedef struct { uint32_t key, n; } ProfEnt;
+typedef struct { uint32_t key, key2, n; } ProfEnt;
 #define PROF_TAB 2048
 static ProfEnt prof_eip[2][PROF_TAB], prof_call[2][PROF_TAB];
 static volatile LONG prof_cur;
@@ -147,12 +147,12 @@ static volatile LONG prof_total[2];
 static HANDLE prof_main;
 static int profile_below; // 0 = off
 
-static void prof_add(ProfEnt *t, uint32_t key) {
-    uint32_t h = (key * 2654435761u) >> 21; // 11 bits
+static void prof_add(ProfEnt *t, uint32_t key, uint32_t key2) {
+    uint32_t h = ((key ^ (key2 * 31u)) * 2654435761u) >> 21; // 11 bits
     for (int i = 0; i < 64; i++) {
         ProfEnt *e = &t[(h + i) & (PROF_TAB - 1)];
-        if (e->key == key) { e->n++; return; }
-        if (e->key == 0) { e->key = key; e->n = 1; return; }
+        if (e->key == key && e->key2 == key2) { e->n++; return; }
+        if (e->key == 0) { e->key = key; e->key2 = key2; e->n = 1; return; }
     }
 }
 
@@ -166,15 +166,18 @@ static DWORD WINAPI prof_thread(LPVOID arg) {
         if (GetThreadContext(prof_main, &c)) {
             int b = prof_cur;
             uint32_t eip = c.Eip;
-            prof_add(prof_eip[b], eip & ~0xfu);
+            prof_add(prof_eip[b], eip & ~0xfu, 0);
             if (eip < 0x401000u || eip >= 0xa00000u) {
                 // nearest return address into the exe's code
                 const uint32_t *sp = (const uint32_t *)c.Esp;
                 MEMORY_BASIC_INFORMATION mi;
                 if (VirtualQuery(sp, &mi, sizeof mi) && mi.State == MEM_COMMIT) {
                     const uint32_t *end = (const uint32_t *)((uint8_t *)mi.BaseAddress + mi.RegionSize);
-                    for (int i = 0; i < 256 && sp + i < end; i++)
-                        if (sp[i] >= 0x401000u && sp[i] < 0xa00000u) { prof_add(prof_call[b], sp[i]); break; }
+                    uint32_t r[2] = {0, 0};
+                    int k = 0;
+                    for (int i = 0; i < 512 && sp + i < end && k < 2; i++)
+                        if (sp[i] >= 0x401000u && sp[i] < 0xa00000u) r[k++] = sp[i];
+                    if (k) prof_add(prof_call[b], r[0], r[1]);
                 }
             }
             InterlockedIncrement(&prof_total[b]);
@@ -209,6 +212,10 @@ static void prof_dump(ProfEnt *t, int total, const char *what) {
     for (int i = 0; i < 16 && tmp[i].n; i++) {
         char nm[96];
         prof_name(tmp[i].key, nm, sizeof nm);
+        if (tmp[i].key2) {
+            size_t l = strlen(nm);
+            snprintf(nm + l, sizeof nm - l, "<%08x", tmp[i].key2);
+        }
         len += snprintf(line + len, sizeof line - len, " %s %.1f%%", nm, 100.0 * tmp[i].n / total);
         if (len > (int)sizeof line - 120) break;
     }
@@ -303,8 +310,8 @@ static void poll_turbo(void) {
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
     int down = pid == GetCurrentProcessId() && (GetAsyncKeyState(turbo_vk) & 0x8000);
     if (down && !turbo_key_was_down) {
-        // Replay playback paces itself to real time (0x5af051) and stalls if
-        // pushed faster, so turbo is for live matches only.
+        // Replay playback paces itself to real time (0x5af051, and again where
+        // the recorded commands are fed in), so turbo is for live matches only.
         uint8_t *rec = *(uint8_t **)0x00bfbf4cu; // TheRecorder; mode 1 = playback
         if (!turbo_on && rec && *(int *)(rec + 0x18) == 1) {
             log_line("turbo isn't available while playing a replay");
@@ -532,10 +539,42 @@ static int redirect_call(uint32_t site, uint32_t target, void *hook, const char 
     return patch_bytes(site, o, n, 5, name);
 }
 
+
+
+
+// The engine's global recursive lock (0x42aab8 lock, 0x430721 unlock) wraps a
+// kernel mutex at 0xbe0fd4, so every lock and unlock is a kernel call even when
+// uncontended (~7% of the main thread in big fights). Nothing else touches that
+// mutex, so its wait and release go to a critical section instead (also
+// recursive, and user-mode when uncontended).
+#define CALL_LOCK_WAIT    0x0042aac3u // call [WaitForSingleObject]
+#define CALL_LOCK_RELEASE 0x0043075fu // call [ReleaseMutex]
+static CRITICAL_SECTION fast_lock;
+static int fast_lock_on = 1; // [debug] FastLock
+static DWORD WINAPI my_lock_wait(HANDLE h, DWORD ms) { (void)h; (void)ms; EnterCriticalSection(&fast_lock); return WAIT_OBJECT_0; }
+static BOOL WINAPI my_lock_release(HANDLE h) { (void)h; LeaveCriticalSection(&fast_lock); return TRUE; }
+
+static void install_fast_lock(void) {
+    if (!fast_lock_on) return;
+    InitializeCriticalSectionAndSpinCount(&fast_lock, 1000);
+    static const uint8_t w_old[] = {0xff, 0x15, 0x70, 0xe1, 0xa0, 0x00}, r_old[] = {0xff, 0x15, 0x04, 0xe1, 0xa0, 0x00};
+    uint8_t w_new[6] = {0xe8, 0, 0, 0, 0, 0x90}, r_new[6] = {0xe8, 0, 0, 0, 0, 0x90};
+    int32_t rw = (int32_t)((uintptr_t)my_lock_wait - (CALL_LOCK_WAIT + 5));
+    int32_t rr = (int32_t)((uintptr_t)my_lock_release - (CALL_LOCK_RELEASE + 5));
+    memcpy(w_new + 1, &rw, 4);
+    memcpy(r_new + 1, &rr, 4);
+    // both or neither: check the release site before patching the wait
+    if (memcmp((void *)CALL_LOCK_RELEASE, r_old, 6) != 0) { log_line("fast lock: unexpected bytes; skipped"); return; }
+    if (patch_bytes(CALL_LOCK_WAIT, w_old, w_new, 6, "lock wait") &&
+        patch_bytes(CALL_LOCK_RELEASE, r_old, r_new, 6, "lock release"))
+        log_line("engine lock uses a critical section");
+}
+
 static void install_stream_fix(void) {
     int a = redirect_call(CALL_STREAM_EMIT, 0x00829c13u, (void *)my_stream_emit, "stream emit");
     int b = redirect_call(CALL_STREAM_BUILD, 0x00828b34u, (void *)my_stream_build, "stream build");
     log_line("stream fix: emit limit %s, segment cap %s", a ? "on" : "FAILED", b ? "on" : "FAILED");
+    install_fast_lock();
 }
 
 
@@ -806,6 +845,7 @@ static void open_log(HMODULE self) {
     pos_trace = GetPrivateProfileIntA("debug", "PosTrace", 0, ini);
     pos_from = GetPrivateProfileIntA("debug", "PosFrom", 1200, ini);
     profile_below = GetPrivateProfileIntA("debug", "Profile", 0, ini);
+    fast_lock_on = GetPrivateProfileIntA("debug", "FastLock", 1, ini);
     strcat(path, "kwfps.log");
     logf = fopen(path, "w"); // one launch per log, so it never grows without limit
 }
