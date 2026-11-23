@@ -30,7 +30,7 @@ It forwards DirectInput to the system DLL, and only inside the game:
   Live matches only (replay playback paces itself to real time).
 - **Income multiplier** (`[cheats] MoneyMult`): replays must be played back with
   the same value.
-- **Timing probe**: one line a second in `kwfps.log` (fps, per-part frame times,
+- **Timing probe**: one line a second in `kwfps.log` (rewritten each launch) (fps, per-part frame times,
   per-sub-step logic times), plus `SPIKE` lines for slow frames.
 
 Every hook checks the bytes it replaces first. On a mismatch it logs and leaves
@@ -44,6 +44,9 @@ that part alone.
   camera following the fighting, stops at the end, and keeps the log and an
   end-screen screenshot in `bench/logs/`.
 - `bench/summary.py <logs>`: per-run averages, percentiles and spike causes.
+- `package.sh`: builds `dist/kwfps-<version>.zip` to share (DLL, `share/kwfps.ini`,
+  `share/README.txt`). It needs the 4K Add-On's 1.3 exe; on anything else the
+  vtable check fails and the DLL patches nothing.
 
 ## kwfps.ini
 
@@ -62,8 +65,8 @@ TurboKey = 122         ; F11
 
 [pacing]
 Enabled = 1
-ClientRate = 162       ; client frames a second the engine assumes; match FrameCap
-FrameCap = 162         ; 0 = uncapped; a little under the refresh rate for G-Sync
+ClientRate = 162       ; client frames a second the engine assumes; auto = refresh - 3 (120 Hz+) or refresh
+FrameCap = 162         ; 0 = uncapped; auto = ClientRate
 Trace = 0              ; frames of interpolation trace to log
 
 [debug]

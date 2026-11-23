@@ -3,3 +3,4 @@ build/
 bench/*.KWReplay
 bench/logs/
 CLAUDE.md
+dist/

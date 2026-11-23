@@ -64,6 +64,7 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) { return E_NOTIMP
 #define G_GAMELOGIC  ((volatile uint8_t **)0x00bf7f98u)
 #define G_ENGINE_PTR ((uint8_t **)0x00bfbf04u) // TheGameEngine (+0x40 sub-step, +0x48 alpha)
 #define G_GLOBALDATA ((volatile uint8_t **)0x00bfbf24u) // TheWritableGlobalData
+#define KWFPS_VERSION "1.0"
 #define GD_CAMERA_MIN_HEIGHT 0xcc // DefaultCameraMinHeight (float, stock 120)
 #define GD_CAMERA_MAX_HEIGHT 0xd0 // DefaultCameraMaxHeight (float, stock 300)
 
@@ -75,6 +76,7 @@ static float money_mult;        // 0 = leave the game's value
 static int turbo_vk;            // virtual key that toggles turbo; 0 = none
 static int turbo_on, turbo_key_was_down;
 static int pacing_on, client_rate, frame_cap; // [pacing] in kwfps.ini
+static int refresh_hz; // desktop refresh rate at startup
 static int push_fix = 1, anim_fix = 1, pos_trace, pos_from = 1200; // [debug]
 
 typedef void(__fastcall *Fn0)(void *self, void *edx);
@@ -676,15 +678,27 @@ static void open_log(HMODULE self) {
     money_mult = (float)atof(buf);
     turbo_vk = GetPrivateProfileIntA("keys", "TurboKey", 0x7A, ini); // F11
     pacing_on = GetPrivateProfileIntA("pacing", "Enabled", 0, ini);
-    client_rate = GetPrivateProfileIntA("pacing", "ClientRate", 165, ini);
-    frame_cap = GetPrivateProfileIntA("pacing", "FrameCap", 162, ini);
+    // "auto" (or 0) follows the desktop refresh rate: 3 under it on 120 Hz+
+    // screens (they're usually G-Sync/FreeSync), the refresh itself below that.
+    DEVMODEA dm = {.dmSize = sizeof dm};
+    int hz = EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) ? (int)dm.dmDisplayFrequency : 60;
+    if (hz < 30 || hz > 500) hz = 60;
+    int auto_rate = hz >= 120 ? hz - 3 : hz;
+    GetPrivateProfileStringA("pacing", "ClientRate", "auto", buf, sizeof buf, ini);
+    client_rate = atoi(buf);
+    if (client_rate <= 0) client_rate = auto_rate;
+    if (client_rate < 30) client_rate = 30;
+    if (client_rate > 360) client_rate = 360;
+    GetPrivateProfileStringA("pacing", "FrameCap", "auto", buf, sizeof buf, ini);
+    frame_cap = _stricmp(buf, "auto") == 0 ? client_rate : atoi(buf); // 0 = uncapped
+    refresh_hz = hz;
     trace_left = GetPrivateProfileIntA("pacing", "Trace", 0, ini);
     push_fix = GetPrivateProfileIntA("debug", "PushFix", 1, ini);
     anim_fix = GetPrivateProfileIntA("debug", "AnimFix", 1, ini);
     pos_trace = GetPrivateProfileIntA("debug", "PosTrace", 0, ini);
     pos_from = GetPrivateProfileIntA("debug", "PosFrom", 1200, ini);
     strcat(path, "kwfps.log");
-    logf = fopen(path, "a");
+    logf = fopen(path, "w"); // one launch per log, so it never grows without limit
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
@@ -708,9 +722,15 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
         if (!is_game) {
             log_line("kwfps loaded in %s: not the game, forwarding only", exe);
         } else {
-            log_line("kwfps loaded; logic fps %d, max fps %d", *G_LOGIC_FPS, *G_MAX_FPS);
-            if (install()) log_line("hooks installed");
-            install_pacing();
+            log_line("kwfps %s loaded; logic fps %d, max fps %d, desktop %d Hz", KWFPS_VERSION, *G_LOGIC_FPS, *G_MAX_FPS, refresh_hz);
+            // The vtable check doubles as the version check: on any other
+            // build of the exe, patch nothing at all.
+            if (install()) {
+                log_line("hooks installed");
+                install_pacing();
+            } else {
+                log_line("not the Steam 1.02 cnc3ep1.dat this was made for; forwarding only");
+            }
         }
         s_start = now_ms();
     } else if (reason == DLL_PROCESS_DETACH && logf) {
