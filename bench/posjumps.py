@@ -5,7 +5,7 @@ import re, sys, statistics
 for path in sys.argv[1:]:
     seqs, cur = [], []
     for l in open(path, errors='replace'):
-        if 'POS track' in l or 'POS lost' in l:
+        if 'POS track' in l or 'POS lost' in l or 'POS next' in l:
             if cur: seqs.append(cur)
             cur = []
         m = re.search(r'POS cf (\d+) .*?\| ([-\d.]+) ([-\d.]+) ', l)

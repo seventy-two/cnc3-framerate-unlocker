@@ -75,7 +75,7 @@ static float money_mult;        // 0 = leave the game's value
 static int turbo_vk;            // virtual key that toggles turbo; 0 = none
 static int turbo_on, turbo_key_was_down;
 static int pacing_on, client_rate, frame_cap; // [pacing] in kwfps.ini
-static int push_fix = 1, anim_fix = 1, pos_trace; // [debug]
+static int push_fix = 1, anim_fix = 1, pos_trace, pos_from = 1200; // [debug]
 
 typedef void(__fastcall *Fn0)(void *self, void *edx);
 typedef void(__fastcall *Fn1)(void *self, void *edx, int a);
@@ -435,8 +435,8 @@ static void install_stream_fix(void) {
 #define FN_INTERP_POS 0x004bf012u
 typedef uint8_t *(__fastcall *FnInterp)(uint8_t *d);
 static FnInterp interp_tramp;
-static uint8_t *pos_tracked;
-static int pos_last_frame = -1, pos_idle;
+static uint8_t *pos_tracked, *pos_prev;
+static int pos_last_frame = -1, pos_count;
 
 static int client_frame(void) {
     uint8_t *c = *G_GAMECLIENT;
@@ -445,12 +445,14 @@ static int client_frame(void) {
 
 static uint8_t *__fastcall my_interp_pos(uint8_t *d) {
     uint8_t *r = interp_tramp(d);
-    if (pos_trace <= 0 || logic_frame() < 1200 || *(int *)(d + 0x140) == 0) return r;
+    if (pos_trace <= 0 || logic_frame() < pos_from || *(int *)(d + 0x140) == 0) return r;
     int cf = client_frame();
     float *h = (float *)(d + 0xc4); // p0 c4, p1 d0, p2 dc, p3 e8
     if (!pos_tracked) {
         float dx = h[6] - h[3], dy = h[7] - h[4];
-        if (*(int *)(d + 0x138) != -1 && dx * dx + dy * dy > 1.0f) { pos_tracked = d; pos_idle = 0; log_line("POS track %p", (void *)d); }
+        if (*(int *)(d + 0x138) != -1 && dx * dx + dy * dy > 1.0f && d != pos_prev) {
+            pos_tracked = d; pos_count = 0; log_line("POS track %p", (void *)d);
+        }
         else return r;
     }
     if (d != pos_tracked || cf == pos_last_frame) return r;
@@ -459,7 +461,8 @@ static uint8_t *__fastcall my_interp_pos(uint8_t *d) {
     uint8_t *e = *G_ENGINE_PTR;
     log_line("POS cf %d lf %d sub %d a %.4f moved %d | %.3f %.3f %.3f | p1 %.3f %.3f p2 %.3f %.3f", cf, logic_frame(),
              *(int *)(e + 0x40), *(float *)(e + 0x48), cf - *(int *)(d + 0x138), p[0], p[1], p[2], h[3], h[4], h[6], h[7]);
-    if (cf - *(int *)(d + 0x138) > 200) { pos_tracked = NULL; log_line("POS lost (idle)"); }
+    if (cf - *(int *)(d + 0x138) > 200) { pos_prev = pos_tracked; pos_tracked = NULL; log_line("POS lost (idle)"); }
+    else if (++pos_count >= 600) { pos_prev = pos_tracked; pos_tracked = NULL; log_line("POS next"); }
     pos_trace--;
     return r;
 }
@@ -679,6 +682,7 @@ static void open_log(HMODULE self) {
     push_fix = GetPrivateProfileIntA("debug", "PushFix", 1, ini);
     anim_fix = GetPrivateProfileIntA("debug", "AnimFix", 1, ini);
     pos_trace = GetPrivateProfileIntA("debug", "PosTrace", 0, ini);
+    pos_from = GetPrivateProfileIntA("debug", "PosFrom", 1200, ini);
     strcat(path, "kwfps.log");
     logf = fopen(path, "a");
 }
